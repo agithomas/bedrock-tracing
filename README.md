@@ -12,7 +12,7 @@
 - OpenTelemetry tracing for AWS Bedrock Agent interactions
 - Integration with environment variables for credentials and configuration
 
-## `@trace_decorator` - Tracing Bedrock Agent Responses
+## @trace_decorator - Tracing Bedrock Agent Responses
 The `@trace_decorator` simplifies tracing for Bedrock agent interactions using OpenTelemetry. It automatically captures relevant trace data, including:
 
 - Session details: session.id, agent.id, and agent.alias_id
@@ -73,15 +73,6 @@ session_id = generate_session_id()
 question = "Tell me about Oracle integration not exceeding 100 words."
 agent_response = invoke_bedrock_agent(brt, question, session_id)
 ```
-
-### Environment Variables
-
-Ensure the following environment variables are set before using the library:
-
-- `AWS_ACCESS_KEY`: Your AWS access key
-- `AWS_SECRET_KEY`: Your AWS secret key
-- `AWS_REGION`: The AWS region
-- `BEDROCK_AGENT_ALIAS_ID`: The Bedrock Agent Alias ID
 
 ## License
 

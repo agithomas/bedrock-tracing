@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="bedrock_tracing",
-    version="0.2.4",
+    version="0.2.6",
     author="Agi K Thomas",
     author_email="agikthomas@hotmail.com",
     description="A Python library for tracing Bedrock agent responses with OpenTelemetry.",

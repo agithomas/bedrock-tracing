@@ -56,7 +56,7 @@ def trace_decorator(func):
                     if "chunk" in event:
                         agent_answer = event["chunk"]["bytes"].decode('utf-8').replace("\n", " ")
                         span.set_attribute("agent.answer", agent_answer)
-                        yield f"data: {agent_answer}\n\n"
+                        yield f"{agent_answer}"
                     elif "trace" in event:
                         process_trace_data(event, span)
                     elif "preGuardrailTrace" in event:
@@ -65,6 +65,4 @@ def trace_decorator(func):
                         raise Exception("Unexpected event format", event)
                 else:
                     yield event
-            yield f"data: [DONE]\n\n"
     return wrapper
-
