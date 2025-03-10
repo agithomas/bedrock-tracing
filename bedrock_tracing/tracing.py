@@ -13,6 +13,7 @@ from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 
 
 # Set up logging
+logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
 # Configure OpenTelemetry resource and tracer provider
@@ -43,14 +44,13 @@ orchestration_duration = meter.create_histogram("orchestration_duration", "secon
 def process_trace_data(event, parent_span):
     """Extracts and processes trace data from Bedrock response event."""
     trace_data = event.get("trace", {})
-    
     orchestration_trace = trace_data.get("trace", {}).get("orchestrationTrace", {})
+
     guardrail_trace = trace_data.get("trace", {}).get("guardrailTrace", {})
     failure_trace = trace_data.get("trace", {}).get("failureTrace", {})
     pre_processing_trace = trace_data.get("trace", {}).get("preProcessingTrace", {})
     post_processing_trace = trace_data.get("trace", {}).get("postProcessingTrace", {})
-    logger.debug("Processed Trace Data: %s", json.dumps(trace_data, indent=2))
-
+    guardrail = trace_data.get("guardrail", {})
             
     def create_invocation_type(trace_segment):
         return (
@@ -61,6 +61,11 @@ def process_trace_data(event, parent_span):
                 if guardrail_trace.get("action")
                 else None
             )
+            or (
+                f"GUARDRAIL_ACTION: Grounding_Check"
+                if guardrail.get("inputAssessment") or guardrail.get("outputAssessments")
+                else None
+            )
             or ("LLM_RESPONSE" if trace_segment.get("modelInvocationOutput", {}).get("rawResponse", {}).get("content") else None)
             or "bedrock-agent-execution"
         )
@@ -68,6 +73,7 @@ def process_trace_data(event, parent_span):
         ("preprocessing", pre_processing_trace),
         ("orchestration", orchestration_trace),
         ("guardrails", guardrail_trace),
+        ("guardrails_grounding", guardrail),
         ("postprocessing", post_processing_trace),
         ("failure", failure_trace),
     ]:
@@ -106,7 +112,39 @@ def process_trace_data(event, parent_span):
                             for entity in assessment.get("sensitiveInformationPolicy", {}).get("piiEntities", []):
                                 child_span.set_attribute(f"guardrail.pii.{entity['type']}.match", entity.get("match", "unknown"))
                                 child_span.set_attribute(f"guardrail.pii.{entity['type']}.action", entity.get("action", "unknown"))
-                    
+
+                    if guardrail:
+                        child_span.set_attribute("guardrail.action", "GUARDRAIL_CONTEXT_GROUNDING_CHECK")
+                        for model_output in guardrail.get("modelOutput", []):
+                            try:
+                                model_output_data = json.loads(model_output)
+                                child_span.set_attribute("guardrail.model_output.id", model_output_data.get("id", "unknown"))
+                                child_span.set_attribute("guardrail.model_output.type", model_output_data.get("type", "unknown"))
+                                child_span.set_attribute("guardrail.model_output.role", model_output_data.get("role", "unknown"))
+                                child_span.set_attribute("guardrail.model_output.model", model_output_data.get("model", "unknown"))
+                                child_span.set_attribute("guardrail.model_output.content", json.dumps(model_output_data.get("content", [])))
+                                child_span.set_attribute("guardrail.model_output.stop_reason", model_output_data.get("stop_reason", "unknown"))
+                                child_span.set_attribute("guardrail.model_output.usage.input_tokens", model_output_data.get("usage", {}).get("input_tokens", 0))
+                                child_span.set_attribute("guardrail.model_output.usage.output_tokens", model_output_data.get("usage", {}).get("output_tokens", 0))
+                            except json.JSONDecodeError:
+                                child_span.set_attribute("guardrail.model_output", model_output)
+
+                        input_assessment = guardrail.get("inputAssessment", {})
+                        for key, assessment in input_assessment.items():
+                            metrics = assessment.get("invocationMetrics", {})
+                            child_span.set_attribute(f"guardrail.input_assessment.{key}.processing_latency", metrics.get("guardrailProcessingLatency", 0))
+                            usage = metrics.get("usage", {})
+                            for usage_key, usage_value in usage.items():
+                                child_span.set_attribute(f"guardrail.input_assessment.{key}.usage.{usage_key}", usage_value)
+                            coverage = metrics.get("guardrailCoverage", {}).get("textCharacters", {})
+                            child_span.set_attribute(f"guardrail.input_assessment.{key}.coverage.guarded", coverage.get("guarded", 0))
+                            child_span.set_attribute(f"guardrail.input_assessment.{key}.coverage.total", coverage.get("total", 0))
+
+                        output_assessments = guardrail.get("outputAssessments", {})
+                        for key, assessments in output_assessments.items():
+                            for assessment in assessments:
+                                child_span.set_attribute(f"guardrail.output_assessment.{key}", json.dumps(assessment))
+
                     # Agent-specific attributes
                     child_span.set_attribute("agent.id", trace_data.get("agentId", "unknown"))
                     child_span.set_attribute("agent.name", trace_data.get("agentName", "unknown"))
@@ -160,18 +198,26 @@ def trace_decorator(func):
                 span.set_attribute("agent.alias_id", agent_alias_id)
 
             processed_events = []
-            for event in func(*args, **kwargs):
+            generator = func(*args, **kwargs)
+            for event in generator:
                 if isinstance(event, dict):
                     if "chunk" in event:
                         agent_answer = event["chunk"]["bytes"].decode('utf-8').replace("\n", " ")
                         span.set_attribute("agent.answer", agent_answer)
-                        yield f"{agent_answer}"
-                    elif "trace" in event:
+                        
+                    if "output" in event:
+                        content_list = event.get("output", {}).get("message", {}).get("content", [])
+                        joined_text = " ".join(item["text"] for item in content_list if "text" in item)
+                        span.set_attribute("agent.answer", joined_text)
+                        agent_answer = joined_text 
+                    if "trace" in event:
                         process_trace_data(event, span)
-                    elif "preGuardrailTrace" in event:
+                    if "preGuardrailTrace" in event:
                         logger.debug(json.dumps(event["preGuardrailTrace"], indent=2))
-                    else:
-                        raise Exception("Unexpected event format", event)
+                
+                    yield event
+                elif isinstance(event, str):
+                    yield event
                 else:
                     yield event
     return wrapper
