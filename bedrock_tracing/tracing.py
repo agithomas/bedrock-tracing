@@ -11,6 +11,9 @@ from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 
+from opentelemetry.instrumentation.urllib import URLLibInstrumentor
+URLLibInstrumentor().uninstrument()
+
 
 # Set up logging
 logging.basicConfig(level=logging.ERROR)
@@ -41,6 +44,7 @@ llm_token_usage = meter.create_counter("llm_token_usage", "tokens", "Counts toke
 llm_call_count = meter.create_counter("llm_call_count", "calls", "Counts LLM invocations")
 orchestration_duration = meter.create_histogram("orchestration_duration", "seconds", "Measures orchestration time")
 
+
 def process_trace_data(event, parent_span):
     """Extracts and processes trace data from Bedrock response event."""
     trace_data = event.get("trace", {})
@@ -53,21 +57,32 @@ def process_trace_data(event, parent_span):
     guardrail = trace_data.get("guardrail", {})
             
     def create_invocation_type(trace_segment):
+        model_invocation_type = trace_segment.get("modelInvocationInput", {}).get("type")
+        agent_invocation_type = trace_segment.get("invocationInput", {}).get("invocationType")
+        agent_invocation_type_collab_name = trace_segment.get("invocationInput", {}).get("agentCollaboratorInvocationInput", {}).get("agentCollaboratorName")
+        observation_type = trace_segment.get("observation", {}).get("type")
+        observation_type_collab_name = trace_segment.get("observation", {}).get("agentCollaboratorInvocationOutput", {}).get("agentCollaboratorName")
+        
+        collaborator_name = trace_data.get("collaboratorName")
         return (
-            trace_segment.get("observation", {}).get("type")
-            or trace_segment.get("modelInvocationInput", {}).get("type")
+            (f"Agent Response : {observation_type} ({observation_type_collab_name})" if observation_type and observation_type_collab_name else observation_type)
+            or (f"Agent Input : {agent_invocation_type} ({agent_invocation_type_collab_name})" if agent_invocation_type and agent_invocation_type_collab_name else agent_invocation_type)
+            or (f"{model_invocation_type} ({collaborator_name})" if model_invocation_type and collaborator_name else model_invocation_type)
+            #or trace_segment.get("modelInvocationInput", {}).get("type")
+            or trace_segment.get("modelInvocationInput", {}).get("invocationType")
             or (
                 f"GUARDRAIL_ACTION:{guardrail_trace.get('action')}"
                 if guardrail_trace.get("action")
                 else None
             )
+            or ("Reasoning" if trace_segment.get("rationale", {}).get("text") else None)
             or (
-                f"GUARDRAIL_ACTION: Grounding_Check"
+                f"Guardrails Processing"
                 if guardrail.get("inputAssessment") or guardrail.get("outputAssessments")
                 else None
             )
             or ("LLM_RESPONSE" if trace_segment.get("modelInvocationOutput", {}).get("rawResponse", {}).get("content") else None)
-            or "bedrock-agent-execution"
+            or "bedrock-agent-in-execution"
         )
     for parent_name, trace_segment in [
         ("preprocessing", pre_processing_trace),
@@ -77,29 +92,48 @@ def process_trace_data(event, parent_span):
         ("postprocessing", post_processing_trace),
         ("failure", failure_trace),
     ]:
-        if trace_segment:
-            with tracer.start_as_current_span(parent_name, context=trace.set_span_in_context(parent_span)) as parent_trace_span:
+        if trace_segment:            
+            # with tracer.start_as_current_span(parent_name, context=trace.set_span_in_context(parent_span)) as parent_trace_span:
+            if True:
                 invocation_type = create_invocation_type(trace_segment)
-                with tracer.start_as_current_span(invocation_type, context=trace.set_span_in_context(parent_trace_span)) as child_span:
-                    def parse_dict(prefix, data, child_span):
+                #parent_trace_span.set_attribute("status", "processing")
+                #with tracer.start_as_current_span(invocation_type, context=trace.set_span_in_context(parent_trace_span)) as child_span:
+                with tracer.start_as_current_span(invocation_type, context=trace.set_span_in_context(parent_span), end_on_exit=True) as child_span:
+                    def parse_dict(prefix, data, span):
                         if isinstance(data, dict):
                             for k, v in data.items():
-                                parse_dict(f"{prefix}.{k}" if prefix else k, v, child_span)
+                                parse_dict(f"{prefix}.{k}" if prefix else k, v, span)
                         elif isinstance(data, list):
                             for i, item in enumerate(data):
-                                parse_dict(f"{prefix}[{i}]", item, child_span)
+                                parse_dict(f"{prefix}[{i}]", item, span)
                         else:
-                            child_span.set_attribute(prefix, str(data))
+                            span.set_attribute(prefix, str(data))
                             
                     parse_dict("trace", trace_data, child_span)
 
                     if failure_trace:
                         child_span.set_attribute("failure.reason", failure_trace.get("failureReason", "unknown"))
                     
-                    # # Guardrail tracing attributes
+                    if guardrail.get("outputAssessments"):
+                        for assessment_key, assessment_list in guardrail.get("outputAssessments", {}).items():
+                            if isinstance(assessment_list, list):  # Ensure it's a list of assessments
+                                for assessment in assessment_list:
+                                    if isinstance(assessment, dict):
+                                        for policy_name, policy_data in assessment.items():
+                                            if isinstance(policy_data, dict):
+                                                with tracer.start_as_current_span(policy_name, context=trace.set_span_in_context(child_span)) as policy_span:
+                                                    for key, values in policy_data.items():
+                                                        if isinstance(values, list):
+                                                            for item in values:
+                                                                entity_type = item.get("type") or "unknown"
+                                                                policy_span.set_attribute(f"{policy_name}.{key}.{entity_type}.match", item.get("match", "unknown"))
+                                                                policy_span.set_attribute(f"{policy_name}.{key}.{entity_type}.action", item.get("action", "unknown"))
+                                                        else:
+                                                            policy_span.set_attribute(f"{policy_name}.{key}", str(values))
+                    
+                
+                    # Guardrail tracing attributes
                     if guardrail_trace:
-                        #with tracer.start_as_current_span("guardrail") as guardrail_span:
-                        child_span.set_attribute("guardrail.action", guardrail_trace.get("action", "unknown"))
                         for assessment in guardrail_trace.get("inputAssessments", []) + guardrail_trace.get("outputAssessments", []):
                             for topic in assessment.get("topicPolicy", {}).get("topics", []):
                                 child_span.set_attribute(f"guardrail.topic.{topic['name']}.type", topic.get("type", "unknown"))
@@ -112,38 +146,6 @@ def process_trace_data(event, parent_span):
                             for entity in assessment.get("sensitiveInformationPolicy", {}).get("piiEntities", []):
                                 child_span.set_attribute(f"guardrail.pii.{entity['type']}.match", entity.get("match", "unknown"))
                                 child_span.set_attribute(f"guardrail.pii.{entity['type']}.action", entity.get("action", "unknown"))
-
-                    if guardrail:
-                        child_span.set_attribute("guardrail.action", "GUARDRAIL_CONTEXT_GROUNDING_CHECK")
-                        for model_output in guardrail.get("modelOutput", []):
-                            try:
-                                model_output_data = json.loads(model_output)
-                                child_span.set_attribute("guardrail.model_output.id", model_output_data.get("id", "unknown"))
-                                child_span.set_attribute("guardrail.model_output.type", model_output_data.get("type", "unknown"))
-                                child_span.set_attribute("guardrail.model_output.role", model_output_data.get("role", "unknown"))
-                                child_span.set_attribute("guardrail.model_output.model", model_output_data.get("model", "unknown"))
-                                child_span.set_attribute("guardrail.model_output.content", json.dumps(model_output_data.get("content", [])))
-                                child_span.set_attribute("guardrail.model_output.stop_reason", model_output_data.get("stop_reason", "unknown"))
-                                child_span.set_attribute("guardrail.model_output.usage.input_tokens", model_output_data.get("usage", {}).get("input_tokens", 0))
-                                child_span.set_attribute("guardrail.model_output.usage.output_tokens", model_output_data.get("usage", {}).get("output_tokens", 0))
-                            except json.JSONDecodeError:
-                                child_span.set_attribute("guardrail.model_output", model_output)
-
-                        input_assessment = guardrail.get("inputAssessment", {})
-                        for key, assessment in input_assessment.items():
-                            metrics = assessment.get("invocationMetrics", {})
-                            child_span.set_attribute(f"guardrail.input_assessment.{key}.processing_latency", metrics.get("guardrailProcessingLatency", 0))
-                            usage = metrics.get("usage", {})
-                            for usage_key, usage_value in usage.items():
-                                child_span.set_attribute(f"guardrail.input_assessment.{key}.usage.{usage_key}", usage_value)
-                            coverage = metrics.get("guardrailCoverage", {}).get("textCharacters", {})
-                            child_span.set_attribute(f"guardrail.input_assessment.{key}.coverage.guarded", coverage.get("guarded", 0))
-                            child_span.set_attribute(f"guardrail.input_assessment.{key}.coverage.total", coverage.get("total", 0))
-
-                        output_assessments = guardrail.get("outputAssessments", {})
-                        for key, assessments in output_assessments.items():
-                            for assessment in assessments:
-                                child_span.set_attribute(f"guardrail.output_assessment.{key}", json.dumps(assessment))
 
                     # Agent-specific attributes
                     child_span.set_attribute("agent.id", trace_data.get("agentId", "unknown"))
@@ -181,13 +183,21 @@ def process_trace_data(event, parent_span):
                     child_span.set_attribute(f"{parent_name}.status", trace_segment.get("status", "unknown"))
                     child_span.set_attribute(f"{parent_name}.metadata", json.dumps(trace_segment.get("metadata", {})))
         
-        logger.debug("Processed Trace Data: %s", json.dumps(trace_data, indent=2))
+        logger.debug("Processed Trace Data: %s", json.dumps(trace_data, indent=2, default=str))
+
 
 def trace_decorator(func):
     """Decorator to handle tracing for Bedrock agent responses."""
     @wraps(func)
     def wrapper(*args, **kwargs):
-        with tracer.start_as_current_span("bedrock-agent-execution") as span:
+        current_span = trace.get_current_span()
+        if current_span and current_span.name == "bedrock-agent-execution":
+            span = current_span
+        else:
+            span = tracer.start_span("bedrock-agent-execution")
+        
+        #with tracer.start_as_current_span("bedrock-agent-execution") as span:
+        with trace.use_span(span, end_on_exit=True):
             span.set_attribute("session.id", kwargs.get("session_id", "unknown"))
             agent_id = kwargs.get("agent_id")
             agent_alias_id = kwargs.get("agent_alias_id")
@@ -208,8 +218,7 @@ def trace_decorator(func):
                     if "output" in event:
                         content_list = event.get("output", {}).get("message", {}).get("content", [])
                         joined_text = " ".join(item["text"] for item in content_list if "text" in item)
-                        span.set_attribute("agent.answer", joined_text)
-                        agent_answer = joined_text 
+                        span.set_attribute("agent.answer", joined_text) 
                     if "trace" in event:
                         process_trace_data(event, span)
                     if "preGuardrailTrace" in event:
