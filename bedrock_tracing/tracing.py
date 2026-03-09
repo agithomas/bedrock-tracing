@@ -46,15 +46,28 @@ orchestration_duration = meter.create_histogram("orchestration_duration", "secon
 
 
 def process_trace_data(event, parent_span):
-    """Extracts and processes trace data from Bedrock response event."""
-    trace_data = event.get("trace", {})
-    orchestration_trace = trace_data.get("trace", {}).get("orchestrationTrace", {})
+    """Extracts and processes trace data from Bedrock response event.
 
-    guardrail_trace = trace_data.get("trace", {}).get("guardrailTrace", {})
-    failure_trace = trace_data.get("trace", {}).get("failureTrace", {})
-    pre_processing_trace = trace_data.get("trace", {}).get("preProcessingTrace", {})
-    post_processing_trace = trace_data.get("trace", {}).get("postProcessingTrace", {})
+    Supports both invoke_agent and converse() API trace formats:
+    - invoke_agent: {"trace": {"trace": {"orchestrationTrace": ...}, "guardrail": {...}}}
+    - converse():   {"trace": {"guardrail": {"inputAssessment": ..., "outputAssessments": ...}}}
+    """
+    trace_data = event.get("trace", {})
+    inner_trace = trace_data.get("trace", {})
+    orchestration_trace = inner_trace.get("orchestrationTrace", {})
+
+    guardrail_trace = inner_trace.get("guardrailTrace", {})
+    failure_trace = inner_trace.get("failureTrace", {})
+    pre_processing_trace = inner_trace.get("preProcessingTrace", {})
+    post_processing_trace = inner_trace.get("postProcessingTrace", {})
     guardrail = trace_data.get("guardrail", {})
+
+    # Normalize outputAssessments: converse() returns a list, invoke_agent returns a dict
+    if isinstance(guardrail.get("outputAssessments"), list):
+        normalized = {}
+        for i, assessment in enumerate(guardrail["outputAssessments"]):
+            normalized[str(i)] = [assessment]
+        guardrail["outputAssessments"] = normalized
             
     def create_invocation_type(trace_segment):
         model_invocation_type = trace_segment.get("modelInvocationInput", {}).get("type")
@@ -207,6 +220,30 @@ def trace_decorator(func):
             if agent_alias_id:
                 span.set_attribute("agent.alias_id", agent_alias_id)
 
+            prompt = kwargs.get("prompt")
+            question = kwargs.get("question")
+            model = kwargs.get("model")
+            retrieval_context = kwargs.get("retrieval_context")
+            retrieval_docs = kwargs.get("retrieval_docs")
+
+            if prompt:
+                span.set_attribute("gen_ai.prompt", prompt)
+            if question:
+                span.set_attribute("gen_ai.question", question)
+            if model:
+                span.set_attribute("gen_ai.request.model", model)
+            if retrieval_context:
+                if isinstance(retrieval_context, list):
+                    span.set_attribute("gen_ai.retrieval_context", "\n---\n".join(retrieval_context))
+                else:
+                    span.set_attribute("gen_ai.retrieval_context", retrieval_context)
+            if retrieval_docs:
+                for i, doc in enumerate(retrieval_docs):
+                    span.add_event(f"retrieved-document-{i}", attributes={
+                        "document.name": doc.get("name", "unknown"),
+                        "document.content": doc.get("content", ""),
+                    })
+
             processed_events = []
             generator = func(*args, **kwargs)
             for event in generator:
@@ -214,16 +251,18 @@ def trace_decorator(func):
                     if "chunk" in event:
                         agent_answer = event["chunk"]["bytes"].decode('utf-8').replace("\n", " ")
                         span.set_attribute("agent.answer", agent_answer)
-                        
+                        span.set_attribute("gen_ai.completion", agent_answer)
+
                     if "output" in event:
                         content_list = event.get("output", {}).get("message", {}).get("content", [])
                         joined_text = " ".join(item["text"] for item in content_list if "text" in item)
-                        span.set_attribute("agent.answer", joined_text) 
+                        span.set_attribute("agent.answer", joined_text)
+                        span.set_attribute("gen_ai.completion", joined_text)
                     if "trace" in event:
                         process_trace_data(event, span)
                     if "preGuardrailTrace" in event:
                         logger.debug(json.dumps(event["preGuardrailTrace"], indent=2))
-                
+
                     yield event
                 elif isinstance(event, str):
                     yield event
